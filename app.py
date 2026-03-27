@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-工程管理期刊文献分析系统（Streamlit 版本）- 时间演变分析增强版
+工程管理期刊文献分析系统（Streamlit 版本）- DeepSeek 纯 API 版
+移除 BERTopic，全部使用 DeepSeek API 进行分析
 """
 
 import streamlit as st
@@ -15,22 +16,15 @@ import warnings
 import zipfile
 import shutil
 import io
+from collections import Counter
 warnings.filterwarnings('ignore')
 
 # 导入必要的库
 try:
     from openai import OpenAI
-    from bertopic import BERTopic
-    from sentence_transformers import SentenceTransformer
-    from sklearn.feature_extraction.text import CountVectorizer
-    from umap import UMAP
-    import hdbscan
     import jieba
-    import jieba.posseg as pseg
-    import string
     import plotly.express as px
     import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
 except ImportError as e:
     st.error(f"缺少必要的库：{e}")
     st.stop()
@@ -51,16 +45,18 @@ def init_session_state():
     """初始化所有 session_state 变量"""
     if 'df_result' not in st.session_state:
         st.session_state.df_result = None
-    if 'topic_model' not in st.session_state:
-        st.session_state.topic_model = None
-    if 'topic_info' not in st.session_state:
-        st.session_state.topic_info = None
-    if 'topic_summary_df' not in st.session_state:
-        st.session_state.topic_summary_df = None
+    if 'method_summary_df' not in st.session_state:
+        st.session_state.method_summary_df = None
+    if 'content_summary_df' not in st.session_state:
+        st.session_state.content_summary_df = None
     if 'method_evolution_df' not in st.session_state:
         st.session_state.method_evolution_df = None
     if 'content_evolution_df' not in st.session_state:
         st.session_state.content_evolution_df = None
+    if 'method_expert_summary' not in st.session_state:
+        st.session_state.method_expert_summary = None
+    if 'content_expert_summary' not in st.session_state:
+        st.session_state.content_expert_summary = None
     if 'analysis_complete' not in st.session_state:
         st.session_state.analysis_complete = False
 
@@ -78,15 +74,6 @@ with st.sidebar:
     )
     
     st.markdown("### 📊 参数设置")
-    num_topics_input = st.slider(
-        "主题聚类数量",
-        min_value=5,
-        max_value=50,
-        value=20,
-        step=1,
-        key="num_topics_sidebar"
-    )
-    
     batch_size_input = st.slider(
         "API 批量大小 (篇/批)",
         min_value=1,
@@ -96,11 +83,11 @@ with st.sidebar:
         key="batch_size_sidebar"
     )
     
-    enable_expert_summary = st.checkbox(
-        "🎓 启用主题专家总结",
+    enable_content_summary = st.checkbox(
+        "📝 启用研究内容总结",
         value=True,
-        help="启用后将调用 DeepSeek API 对每个主题进行专业总结",
-        key="enable_expert_sidebar"
+        help="启用后将调用 DeepSeek API 对研究内容进行分类总结",
+        key="enable_content_sidebar"
     )
     
     enable_evolution_analysis = st.checkbox(
@@ -214,7 +201,7 @@ def process_uploaded_files(uploaded_files):
     
     return combined_df, "\n".join(log_messages)
 
-# ==================== DeepSeek API 分析函数 ====================
+# ==================== DeepSeek API 函数 ====================
 def get_deepseek_client(api_key):
     """创建 DeepSeek 客户端"""
     return OpenAI(
@@ -222,14 +209,18 @@ def get_deepseek_client(api_key):
         base_url="https://api.deepseek.com"
     )
 
-def analyze_batch_with_deepseek(batch_data, client, max_retries=3):
-    """批量分析多篇文章"""
+def analyze_articles_batch(batch_data, client, max_retries=3):
+    """批量分析文章的研究方法和研究内容"""
     system_prompt = """你是一位工程管理领域的资深教授。请批量分析工程管理领域的学术论文。
 对于每篇论文，根据标题和摘要识别：
-1. 研究方法：使用学术专有名词
-2. 研究内容：建筑工程管理中针对的具体问题
+1. 研究方法：使用学术专有名词（如：案例分析、问卷调查、文献综述、实证研究、建模与仿真、实验研究、结构方程模型、回归分析等）
+2. 研究内容：建筑工程管理中针对的具体问题（如：成本控制、进度管理、风险管理、质量管理、供应链管理等）
 
-请严格按照 JSON 格式返回。"""
+请严格按照 JSON 格式返回：
+[
+  {"article_index": 1, "research_method": "方法", "research_content": "内容"},
+  ...
+]"""
 
     articles_text = ""
     for i, article in enumerate(batch_data):
@@ -277,8 +268,8 @@ def analyze_batch_with_deepseek(batch_data, client, max_retries=3):
                 return [{"article_index": i+1, "research_method": "API 失败", "research_content": "API 失败"} 
                         for i in range(len(batch_data))]
 
-def run_deepseek_analysis(df, client, batch_size=10):
-    """执行 DeepSeek 分析"""
+def run_article_analysis(df, client, batch_size=10):
+    """执行文章分析"""
     if df is None or len(df) == 0:
         return None, "❌ 没有数据可供分析"
     
@@ -310,7 +301,7 @@ def run_deepseek_analysis(df, client, batch_size=10):
             })
         
         status_text.text(f"分析进度：{batch_num + 1}/{num_batches} 批次")
-        results = analyze_batch_with_deepseek(batch_data, client)
+        results = analyze_articles_batch(batch_data, client)
         
         for result in results:
             article_idx = result.get("article_index", 1) - 1
@@ -336,198 +327,73 @@ def run_deepseek_analysis(df, client, batch_size=10):
     
     return df, "\n".join(log_messages)
 
-# ==================== BERTopic 主题挖掘函数 ====================
-def preprocess_text_keep_nouns(text):
-    """中文文本预处理，保留名词"""
-    punctuation = set(string.punctuation)
-    chinese_punctuation = "，。！？；：、""''（）《》〈〉【】[]—…·,.!?;:\"'()<>/\\|-_=+*&^%$#@~`"
-    punctuation.update(set(chinese_punctuation))
-    
-    noun_flags = {"n", "nr", "ns", "nt", "nz", "nl", "ng"}
-    
-    basic_stopwords = {
-        "的", "了", "和", "是", "在", "与", "及", "或", "而", "并", "等", "中", "对", "将", "把",
-        "被", "为", "以", "于", "上", "下", "内", "外", "后", "前", "时", "其", "其中", "一个",
-        "一种", "一些", "这", "那", "这些", "那些", "该", "各", "每", "多", "很多", "较", "进一步",
-        "通过", "根据", "对于", "由于", "因此", "所以", "但是", "如果", "然后", "以及", "此外", "同时",
-        "并且", "进行", "采用", "使用", "基于", "具有", "存在", "可以", "可能", "能够", "已经", "主要",
-        "相关", "不同", "分别", "非常", "比较", "一定", "目前", "本文", "本研究", "本论文", "本章", "本节",
-        "作者", "研究", "结果", "问题", "分析", "影响", "意义", "方面", "情况", "因素", "过程", "工作",
-        "数据", "实验", "模型", "系统", "设计", "实现", "结论", "发现", "提出", "说明", "表明", "讨论",
-        "总结", "指出", "应用", "特征", "机制", "水平", "能力", "功能", "部分", "基础", "目标", "背景",
-        "现状", "策略", "路径", "效果", "建议", "价值", "理论", "实践", "视角", "视域", "维度"
-    }
-    
-    text = text.strip()
-    text = re.sub(r"\s+", " ", text)
-    
-    words = pseg.cut(text)
-    filtered_words = []
-    
-    for word, flag in words:
-        word = word.strip()
-        if not word:
-            continue
-        if all(char in punctuation for char in word):
-            continue
-        if re.fullmatch(r"\d+(\.\d+)?", word):
-            continue
-        if len(word) == 1 and word not in {"法", "学", "史", "论"}:
-            continue
-        if flag not in noun_flags:
-            continue
-        if word in basic_stopwords:
-            continue
-        filtered_words.append(word)
-    
-    return " ".join(filtered_words)
-
-def run_bertopic_analysis(df, num_topics=20):
-    """执行 BERTopic 主题挖掘"""
+# ==================== ⭐ 研究内容分类总结函数 ====================
+def summarize_content_categories(df, client):
+    """使用 DeepSeek 对研究内容进行分类总结"""
     if df is None or len(df) == 0:
         return None, "❌ 没有数据可供分析", None
     
     if '研究内容' not in df.columns:
-        return None, "❌ 请先执行 DeepSeek 分析", None
+        return None, "❌ 请先完成文章分析", None
     
     log_messages = []
-    log_messages.append("🔍 开始 BERTopic 主题挖掘")
+    log_messages.append("=" * 60)
+    log_messages.append("📝 步骤 2: 研究内容分类总结 (DeepSeek API)")
+    log_messages.append("=" * 60)
     
-    raw_docs = df['研究内容'].dropna().astype(str).tolist()
-    log_messages.append(f"📄 共读取 {len(raw_docs)} 条文本")
+    # 收集所有研究内容
+    all_contents = df['研究内容'].dropna().unique().tolist()
+    all_contents = [c for c in all_contents if c and c != '未识别' and c != 'API 失败']
     
-    docs = [preprocess_text_keep_nouns(doc) for doc in raw_docs]
-    processed_pairs = [(raw, doc) for raw, doc in zip(raw_docs, docs) if doc.strip()]
-    docs = [x[1] for x in processed_pairs]
-    raw_docs_cleaned = [x[0] for x in processed_pairs]
+    if len(all_contents) == 0:
+        return None, "❌ 没有有效的研究内容数据", None
     
-    log_messages.append(f"🧹 清洗后保留 {len(docs)} 条文本")
+    log_messages.append(f"📊 共有 {len(all_contents)} 条独立的研究内容")
+    log_messages.append(f"🤖 调用 DeepSeek API 进行分类总结...\n")
     
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    # 分批处理（每批 20 条内容）
+    batch_size = 20
+    num_batches = (len(all_contents) + batch_size - 1) // batch_size
     
-    log_messages.append("⚙️ 初始化 BERTopic 模型...")
+    all_categories = []
     
-    try:
-        with st.spinner("正在加载 BERTopic 模型..."):
-            embedding_model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
-        
-        def whitespace_tokenizer(text):
-            return text.split()
-        
-        vectorizer_model = CountVectorizer(
-            tokenizer=whitespace_tokenizer,
-            token_pattern=None,
-            min_df=2
-        )
-        
-        umap_model = UMAP(
-            n_neighbors=15,
-            n_components=5,
-            min_dist=0.0,
-            metric="cosine",
-            random_state=42
-        )
-        
-        hdbscan_model = hdbscan.HDBSCAN(
-            min_cluster_size=10,
-            metric="euclidean",
-            cluster_selection_method="eom",
-            prediction_data=True
-        )
-        
-        topic_model = BERTopic(
-            embedding_model=embedding_model,
-            vectorizer_model=vectorizer_model,
-            umap_model=umap_model,
-            hdbscan_model=hdbscan_model,
-            nr_topics=num_topics,
-            language="multilingual",
-            calculate_probabilities=True,
-            verbose=True
-        )
-        
-        log_messages.append("🚀 开始训练模型...")
-        
-        with st.spinner("正在训练主题模型..."):
-            topics, probs = topic_model.fit_transform(docs)
-        
-        topic_info = topic_model.get_topic_info()
-        doc_info = topic_model.get_document_info(docs)
-        
-        log_messages.append("💾 保存 BERTopic 结果...")
-        
-        topic_model.save(os.path.join(OUTPUT_DIR, "bertopic_model"))
-        
-        log_messages.append("📊 生成可视化...")
-        
-        try:
-            fig_topics = topic_model.visualize_topics()
-            fig_topics.write_html(os.path.join(OUTPUT_DIR, "bertopic_topics.html"))
-        except:
-            pass
-        
-        try:
-            fig_barchart = topic_model.visualize_barchart(top_n_topics=num_topics)
-            fig_barchart.write_html(os.path.join(OUTPUT_DIR, "bertopic_barchart.html"))
-        except:
-            pass
-        
-        log_messages.append(f"\n✅ 主题挖掘完成！")
-        log_messages.append(f"📊 发现 {len(topic_info)} 个主题")
-        
-        log_messages.append(f"\n📈 前 10 个主题:")
-        for idx, row in topic_info.head(10).iterrows():
-            log_messages.append(f"   主题{row['Topic']}: {row['Name']} ({row['Count']}篇)")
-        
-        df_with_topics = df.copy()
-        df_with_topics['主题编号'] = doc_info["Topic"].values
-        df_with_topics['主题名称'] = doc_info["Name"].values
-        df_with_topics['主题概率'] = doc_info["Probability"].values
-        
-        # 存储到 session_state
-        st.session_state.topic_model = topic_model
-        st.session_state.topic_info = topic_info
-        
-        return df_with_topics, "\n".join(log_messages), topic_info
-        
-    except Exception as e:
-        log_messages.append(f"❌ BERTopic 分析出错：{str(e)}")
-        return None, "\n".join(log_messages), None
-
-# ==================== 主题专家总结函数 ====================
-def get_topic_keywords(topic_model, topic_id, top_n=10):
-    """获取某个主题的代表性关键词"""
-    try:
-        topic_words, _ = topic_model.get_topic(topic_id)
-        keywords = [word for word, _ in topic_words[:top_n]]
-        return ", ".join(keywords)
-    except:
-        return "无法获取关键词"
-
-def summarize_topic_with_deepseek(topic_id, topic_keywords, topic_name, client, max_retries=3):
-    """使用 DeepSeek 对单个主题进行专家总结"""
+    progress_bar = st.progress(0)
+    status_text = st.empty()
     
-    system_prompt = """你是一位工程管理领域的资深教授和学术专家。
-请根据 BERTopic 主题模型生成的主题关键词，对该研究主题进行专业、深入的学术总结。
+    for batch_num in range(num_batches):
+        start_idx = batch_num * batch_size
+        end_idx = min((batch_num + 1) * batch_size, len(all_contents))
+        batch_contents = all_contents[start_idx:end_idx]
+        
+        status_text.text(f"分类进度：{batch_num + 1}/{num_batches} 批次")
+        
+        # 构建提示词
+        system_prompt = """你是一位工程管理领域的资深教授和学术专家。
+请对以下研究内容进行学术分类和总结。
 
-请从以下角度进行分析：
-1. 主题定位
-2. 研究焦点
-3. 理论价值
-4. 实践意义
-5. 发展趋势
+请将研究内容归类到以下主要类别中（可补充）：
+1. 成本管理
+2. 进度管理
+3. 质量管理
+4. 风险管理
+5. 安全管理
+6. 供应链管理
+7. 可持续发展/绿色建筑
+8. 数字化/BIM/智能建造
+9. 合同与法律
+10. 组织与人力资源
+11. 创新管理
+12. 其他
 
-请用专业、严谨的学术语言进行总结，字数控制在 200-300 字之间。"""
-
-    user_prompt = f"""请对以下工程管理研究主题进行专家总结：
-
-主题编号：{topic_id}
-主题名称：{topic_name}
-主题关键词：{topic_keywords}
-
-请作为工程管理专家，对该主题进行深入分析和总结。"""
-
-    for attempt in range(max_retries):
+请按照以下 JSON 格式返回：
+[
+  {"content": "原始研究内容", "category": "分类", "keywords": "关键词 1, 关键词 2, ..."},
+  ...
+]"""
+        
+        contents_text = "\n".join([f"{i+1}. {c}" for i, c in enumerate(batch_contents)])
+        user_prompt = f"请对以下{len(batch_contents)}条研究内容进行分类：\n\n{contents_text}"
+        
         try:
             response = client.chat.completions.create(
                 model="deepseek-chat",
@@ -535,116 +401,245 @@ def summarize_topic_with_deepseek(topic_id, topic_keywords, topic_name, client, 
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                max_tokens=600,
-                temperature=0.3,
+                max_tokens=4000,
+                temperature=0.1,
                 stream=False
             )
             
             result = response.choices[0].message.content
-            return result.strip()
             
-        except Exception as e:
-            if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)
+            # 解析 JSON
+            json_match = re.search(r'\[\s*\{.*\}\s*\]', result, re.DOTALL)
+            if json_match:
+                try:
+                    batch_results = json.loads(json_match.group(0))
+                    all_categories.extend(batch_results)
+                except:
+                    # 解析失败，手动处理
+                    for content in batch_contents:
+                        all_categories.append({
+                            "content": content,
+                            "category": "其他",
+                            "keywords": ""
+                        })
             else:
-                return f"API 调用失败：{str(e)[:50]}"
-
-def run_topic_expert_summary(df, client):
-    """执行主题专家总结"""
-    if 'topic_model' not in st.session_state or st.session_state.topic_model is None:
-        return None, "❌ BERTopic 模型未初始化，请重新运行主题挖掘步骤", None
-    
-    if 'topic_info' not in st.session_state or st.session_state.topic_info is None:
-        return None, "❌ 主题信息未初始化，请重新运行主题挖掘步骤", None
-    
-    if df is None or len(df) == 0:
-        return None, "❌ 没有数据可供分析", None
-    
-    topic_model = st.session_state.topic_model
-    topic_info = st.session_state.topic_info
-    
-    log_messages = []
-    log_messages.append("=" * 60)
-    log_messages.append("🎓 步骤 4: 主题专家总结 (DeepSeek API)")
-    log_messages.append("=" * 60)
-    
-    topics_to_summarize = topic_info[topic_info['Topic'] != -1].copy()
-    num_topics = len(topics_to_summarize)
-    
-    if num_topics == 0:
-        return None, "❌ 没有有效主题可总结", None
-    
-    log_messages.append(f"📊 共有 {num_topics} 个主题需要总结")
-    log_messages.append(f"🤖 调用 DeepSeek API 进行专家总结...\n")
-    
-    topic_summaries = []
-    
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    for idx, row in enumerate(topics_to_summarize.iterrows()):
-        topic_id = row[1]['Topic']
-        topic_name = row[1]['Name']
+                for content in batch_contents:
+                    all_categories.append({
+                        "content": content,
+                        "category": "其他",
+                        "keywords": ""
+                    })
         
-        status_text.text(f"主题总结进度：{idx + 1}/{num_topics}")
+        except Exception as e:
+            for content in batch_contents:
+                all_categories.append({
+                    "content": content,
+                    "category": "其他",
+                    "keywords": ""
+                })
         
-        topic_keywords = get_topic_keywords(topic_model, topic_id, top_n=15)
-        
-        summary = summarize_topic_with_deepseek(topic_id, topic_keywords, topic_name, client)
-        
-        topic_summaries.append({
-            '主题编号': topic_id,
-            '主题名称': topic_name,
-            '主题关键词': topic_keywords,
-            '文章数量': row[1]['Count'],
-            '专家总结': summary
-        })
-        
-        progress_bar.progress((idx + 1) / num_topics)
-        time.sleep(1)
+        progress_bar.progress((batch_num + 1) / num_batches)
+        time.sleep(2)
     
     progress_bar.empty()
     status_text.empty()
     
-    topic_summary_df = pd.DataFrame(topic_summaries)
+    # 创建分类总结 DataFrame
+    category_df = pd.DataFrame(all_categories)
     
-    log_messages.append(f"\n✅ 主题专家总结完成！")
-    log_messages.append(f"📊 成功总结 {len(topic_summary_df)} 个主题")
+    # 统计各分类的文章数量
+    category_stats = []
+    for category in category_df['category'].unique():
+        cat_contents = category_df[category_df['category'] == category]['content'].tolist()
+        article_count = df[df['研究内容'].isin(cat_contents)].shape[0]
+        category_stats.append({
+            '分类': category,
+            '研究内容数量': len(cat_contents),
+            '文章数量': article_count,
+            '占比': f"{article_count/len(df)*100:.1f}%"
+        })
     
+    category_stats_df = pd.DataFrame(category_stats)
+    category_stats_df = category_stats_df.sort_values('文章数量', ascending=False)
+    
+    log_messages.append(f"\n✅ 研究内容分类完成！")
+    log_messages.append(f"📊 共识别 {len(category_stats_df)} 个研究类别")
+    
+    log_messages.append(f"\n📈 主要研究类别分布:")
+    for idx, row in category_stats_df.head(10).iterrows():
+        log_messages.append(f"   {row['分类']}: {row['文章数量']}篇 ({row['占比']})")
+    
+    # 保存到 session_state
+    st.session_state.content_summary_df = category_stats_df
+    st.session_state.content_detail_df = category_df
+    
+    # 保存结果
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    summary_path = os.path.join(OUTPUT_DIR, f"主题专家总结_{timestamp}.xlsx")
-    topic_summary_df.to_excel(summary_path, index=False, encoding='utf-8')
+    category_stats_df.to_excel(os.path.join(OUTPUT_DIR, f"研究内容分类统计_{timestamp}.xlsx"), index=False)
+    category_df.to_excel(os.path.join(OUTPUT_DIR, f"研究内容分类详情_{timestamp}.xlsx"), index=False)
     
-    df_with_summary = df.copy()
-    
-    summary_map = topic_summary_df.set_index('主题编号')['专家总结'].to_dict()
-    keywords_map = topic_summary_df.set_index('主题编号')['主题关键词'].to_dict()
-    
-    df_with_summary['主题关键词'] = df_with_summary['主题编号'].map(keywords_map)
-    df_with_summary['主题专家总结'] = df_with_summary['主题编号'].map(summary_map)
-    
-    st.session_state.topic_summary_df = topic_summary_df
-    
-    return df_with_summary, "\n".join(log_messages), topic_summary_df
+    return category_stats_df, "\n".join(log_messages), category_df
 
-# ==================== ⭐ 新增：时间演变分析函数 ====================
+# ==================== ⭐ 研究方法总结函数 ====================
+def summarize_method_categories(df, client):
+    """使用 DeepSeek 对研究方法进行分类总结"""
+    if df is None or len(df) == 0:
+        return None, "❌ 没有数据可供分析", None
+    
+    if '研究方法' not in df.columns:
+        return None, "❌ 请先完成文章分析", None
+    
+    log_messages = []
+    log_messages.append("=" * 60)
+    log_messages.append("🎯 步骤 3: 研究方法分类总结 (DeepSeek API)")
+    log_messages.append("=" * 60)
+    
+    # 收集所有研究方法
+    all_methods = []
+    for methods in df['研究方法'].dropna():
+        if methods and methods != '未识别' and methods != 'API 失败':
+            method_list = re.split(r'[,,;,]', methods)
+            all_methods.extend([m.strip() for m in method_list if m.strip()])
+    
+    if len(all_methods) == 0:
+        return None, "❌ 没有有效的研究方法数据", None
+    
+    unique_methods = list(set(all_methods))
+    log_messages.append(f"📊 共有 {len(unique_methods)} 种独立的研究方法")
+    log_messages.append(f"📊 总计 {len(all_methods)} 次方法使用")
+    log_messages.append(f"🤖 调用 DeepSeek API 进行分类总结...\n")
+    
+    # 统计每种方法的使用频率
+    method_counts = Counter(all_methods)
+    
+    # 构建方法分类提示词
+    system_prompt = """你是一位工程管理领域的资深教授和学术专家。
+请对以下研究方法进行学术分类。
+
+请将研究方法归类到以下主要类别中：
+1. 定性研究（案例分析、访谈、观察法、扎根理论等）
+2. 定量研究（问卷调查、回归分析、结构方程模型等）
+3. 混合方法（定性 + 定量结合）
+4. 文献研究（文献综述、元分析、系统综述等）
+5. 建模与仿真（系统动力学、Agent-based、离散事件仿真等）
+6. 实验研究（实验室实验、现场实验、准实验等）
+7. 其他
+
+请按照以下 JSON 格式返回：
+[
+  {"method": "方法名称", "category": "分类", "description": "方法简述"},
+  ...
+]"""
+    
+    methods_text = "\n".join([f"{i+1}. {m}" for i, m in enumerate(unique_methods[:50])])  # 限制 50 种
+    user_prompt = f"请对以下研究方法进行分类：\n\n{methods_text}"
+    
+    try:
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_tokens=4000,
+            temperature=0.1,
+            stream=False
+        )
+        
+        result = response.choices[0].message.content
+        
+        # 解析 JSON
+        json_match = re.search(r'\[\s*\{.*\}\s*\]', result, re.DOTALL)
+        if json_match:
+            try:
+                method_categories = json.loads(json_match.group(0))
+            except:
+                method_categories = []
+        else:
+            method_categories = []
+        
+        # 创建方法分类 DataFrame
+        method_summary_data = []
+        for method, count in method_counts.most_common(30):  # 前 30 种方法
+            category = "其他"
+            description = ""
+            for mc in method_categories:
+                if mc.get('method') == method:
+                    category = mc.get('category', '其他')
+                    description = mc.get('description', '')
+                    break
+            
+            method_summary_data.append({
+                '研究方法': method,
+                '使用次数': count,
+                '占比': f"{count/len(all_methods)*100:.1f}%",
+                '方法类别': category,
+                '方法描述': description
+            })
+        
+        method_summary_df = pd.DataFrame(method_summary_data)
+        
+        # 按类别统计
+        category_summary = method_summary_df.groupby('方法类别').agg({
+            '使用次数': 'sum',
+            '研究方法': 'count'
+        }).reset_index()
+        category_summary.columns = ['方法类别', '总使用次数', '方法数量']
+        category_summary = category_summary.sort_values('总使用次数', ascending=False)
+        
+        log_messages.append(f"\n✅ 研究方法分类完成！")
+        log_messages.append(f"📊 共识别 {len(category_summary)} 个方法类别")
+        
+        log_messages.append(f"\n📈 主要方法类别分布:")
+        for idx, row in category_summary.iterrows():
+            log_messages.append(f"   {row['方法类别']}: {row['总使用次数']}次 ({row['方法数量']}种方法)")
+        
+        # 保存到 session_state
+        st.session_state.method_summary_df = method_summary_df
+        st.session_state.method_category_df = category_summary
+        
+        # 保存结果
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        method_summary_df.to_excel(os.path.join(OUTPUT_DIR, f"研究方法分类统计_{timestamp}.xlsx"), index=False)
+        category_summary.to_excel(os.path.join(OUTPUT_DIR, f"研究方法类别汇总_{timestamp}.xlsx"), index=False)
+        
+        return method_summary_df, "\n".join(log_messages), category_summary
+        
+    except Exception as e:
+        log_messages.append(f"❌ 分类失败：{str(e)}")
+        
+        # 返回基础统计
+        method_summary_data = []
+        for method, count in method_counts.most_common(30):
+            method_summary_data.append({
+                '研究方法': method,
+                '使用次数': count,
+                '占比': f"{count/len(all_methods)*100:.1f}%",
+                '方法类别': '未分类',
+                '方法描述': ''
+            })
+        
+        method_summary_df = pd.DataFrame(method_summary_data)
+        st.session_state.method_summary_df = method_summary_df
+        
+        return method_summary_df, "\n".join(log_messages), None
+
+# ==================== ⭐ 时间演变分析函数 ====================
 def extract_top_methods(df, top_n=10):
     """提取出现频率最高的研究方法"""
     if '研究方法' not in df.columns:
         return []
     
-    # 清理和分割研究方法
     all_methods = []
     for methods in df['研究方法'].dropna():
-        if methods and methods != '未识别' and methods != 'API 调用失败':
-            # 按逗号、顿号、分号分割
+        if methods and methods != '未识别' and methods != 'API 失败':
             method_list = re.split(r'[,,;,]', methods)
             all_methods.extend([m.strip() for m in method_list if m.strip()])
     
-    # 统计频率
-    from collections import Counter
     method_counts = Counter(all_methods)
     top_methods = [method for method, count in method_counts.most_common(top_n)]
     
@@ -658,14 +653,12 @@ def extract_keywords_from_content(df, top_n=20):
     all_keywords = []
     for content in df['研究内容'].dropna():
         if content and content != '未识别':
-            # 使用 jieba 分词
             words = jieba.cut(content)
             for word in words:
                 word = word.strip()
-                if len(word) >= 2:  # 只保留 2 字以上的词
+                if len(word) >= 2:
                     all_keywords.append(word)
     
-    from collections import Counter
     keyword_counts = Counter(all_keywords)
     top_keywords = [keyword for keyword, count in keyword_counts.most_common(top_n)]
     
@@ -674,7 +667,6 @@ def extract_keywords_from_content(df, top_n=20):
 def summarize_method_evolution(df, client, top_methods):
     """使用 DeepSeek 对研究方法演变进行专家总结"""
     
-    # 准备数据
     evolution_data = []
     for method in top_methods:
         yearly_counts = df[df['研究方法'].str.contains(method, na=False)].groupby('Publication Year').size()
@@ -688,22 +680,20 @@ def summarize_method_evolution(df, client, top_methods):
     if not evolution_data:
         return "数据不足，无法生成总结", None
     
-    # 构建提示词
     system_prompt = """你是一位工程管理领域的资深教授和学术专家。
 请根据研究方法的时间分布数据，分析该领域研究方法的演变趋势。
 
 请从以下角度进行分析：
 1. 总体演变趋势：哪些方法在兴起，哪些在衰退
 2. 关键转折点：哪一年出现了明显的方法论转变
-3. 原因分析：为什么会出现这样的演变（技术发展、政策变化等）
+3. 原因分析：为什么会出现这样的演变
 4. 未来预测：未来 3-5 年可能的主流研究方法
 5. 建议：对研究者的方法论选择建议
 
 请用专业、严谨的学术语言进行总结，字数控制在 300-400 字之间。"""
 
-    # 准备数据摘要
     data_summary = "研究方法时间分布数据：\n"
-    for method in top_methods[:5]:  # 只取前 5 个方法
+    for method in top_methods[:5]:
         method_data = [d for d in evolution_data if d['研究方法'] == method]
         data_summary += f"\n{method}:\n"
         for d in sorted(method_data, key=lambda x: x['年份']):
@@ -736,7 +726,6 @@ def summarize_method_evolution(df, client, top_methods):
 def summarize_content_evolution(df, client, top_keywords):
     """使用 DeepSeek 对研究内容演变进行专家总结"""
     
-    # 准备数据
     evolution_data = []
     for keyword in top_keywords:
         yearly_counts = df[df['研究内容'].str.contains(keyword, na=False)].groupby('Publication Year').size()
@@ -750,7 +739,6 @@ def summarize_content_evolution(df, client, top_keywords):
     if not evolution_data:
         return "数据不足，无法生成总结", None
     
-    # 构建提示词
     system_prompt = """你是一位工程管理领域的资深教授和学术专家。
 请根据研究内容关键词的时间分布数据，分析该领域研究热点的演变趋势。
 
@@ -763,9 +751,8 @@ def summarize_content_evolution(df, client, top_keywords):
 
 请用专业、严谨的学术语言进行总结，字数控制在 300-400 字之间。"""
 
-    # 准备数据摘要
     data_summary = "研究内容关键词时间分布数据：\n"
-    for keyword in top_keywords[:5]:  # 只取前 5 个关键词
+    for keyword in top_keywords[:5]:
         keyword_data = [d for d in evolution_data if d['关键词'] == keyword]
         data_summary += f"\n{keyword}:\n"
         for d in sorted(keyword_data, key=lambda x: x['年份']):
@@ -800,7 +787,6 @@ def create_method_evolution_chart(evolution_df, top_methods):
     if evolution_df is None or len(evolution_df) == 0:
         return None
     
-    # 创建透视表
     pivot_df = evolution_df.pivot_table(
         index='年份',
         columns='研究方法',
@@ -809,12 +795,10 @@ def create_method_evolution_chart(evolution_df, top_methods):
         fill_value=0
     )
     
-    # 只保留前几个方法
     if len(top_methods) > 8:
         top_methods = top_methods[:8]
         pivot_df = pivot_df[top_methods]
     
-    # 创建交互式图表
     fig = go.Figure()
     
     for method in pivot_df.columns:
@@ -845,7 +829,6 @@ def create_content_evolution_chart(evolution_df, top_keywords):
     if evolution_df is None or len(evolution_df) == 0:
         return None
     
-    # 创建透视表
     pivot_df = evolution_df.pivot_table(
         index='年份',
         columns='关键词',
@@ -854,12 +837,10 @@ def create_content_evolution_chart(evolution_df, top_keywords):
         fill_value=0
     )
     
-    # 只保留前几个关键词
     if len(top_keywords) > 8:
         top_keywords = top_keywords[:8]
         pivot_df = pivot_df[top_keywords]
     
-    # 创建交互式图表
     fig = go.Figure()
     
     for keyword in pivot_df.columns:
@@ -895,10 +876,9 @@ def run_evolution_analysis(df, client):
     
     log_messages = []
     log_messages.append("=" * 60)
-    log_messages.append("📈 步骤 5: 时间维度演变分析 (DeepSeek API)")
+    log_messages.append("📈 步骤 4: 时间维度演变分析 (DeepSeek API)")
     log_messages.append("=" * 60)
     
-    # 提取高频研究方法和关键词
     log_messages.append("🔍 提取高频研究方法和关键词...")
     top_methods = extract_top_methods(df, top_n=10)
     top_keywords = extract_keywords_from_content(df, top_n=20)
@@ -906,30 +886,28 @@ def run_evolution_analysis(df, client):
     log_messages.append(f"   识别到 {len(top_methods)} 个主要研究方法")
     log_messages.append(f"   识别到 {len(top_keywords)} 个研究热点关键词")
     
-    # 研究方法演变分析
     log_messages.append("\n🎯 分析研究方法演变趋势...")
     method_summary, method_evolution_df = summarize_method_evolution(df, client, top_methods)
     
     if method_evolution_df is not None and len(method_evolution_df) > 0:
         log_messages.append(f"   ✅ 生成 {len(method_evolution_df)} 条研究方法演变数据")
         st.session_state.method_evolution_df = method_evolution_df
+        st.session_state.method_expert_summary = method_summary
     
-    # 研究内容演变分析
     log_messages.append("\n📝 分析研究内容演变趋势...")
     content_summary, content_evolution_df = summarize_content_evolution(df, client, top_keywords)
     
     if content_evolution_df is not None and len(content_evolution_df) > 0:
         log_messages.append(f"   ✅ 生成 {len(content_evolution_df)} 条研究内容演变数据")
         st.session_state.content_evolution_df = content_evolution_df
+        st.session_state.content_expert_summary = content_summary
     
     log_messages.append(f"\n✅ 时间演变分析完成！")
     
-    # 创建可视化图表
     log_messages.append("\n📊 生成可视化图表...")
     method_chart = create_method_evolution_chart(method_evolution_df, top_methods)
     content_chart = create_content_evolution_chart(content_evolution_df, top_keywords)
     
-    # 保存图表
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
@@ -941,7 +919,7 @@ def run_evolution_analysis(df, client):
     return method_summary, content_summary, "\n".join(log_messages), method_chart, content_chart
 
 # ==================== 保存和打包结果函数 ====================
-def create_download_package(df, topic_summary_df, method_evolution_df, content_evolution_df):
+def create_download_package(df, method_summary_df, content_summary_df, method_evolution_df, content_evolution_df):
     """创建可下载的 ZIP 包"""
     if df is None or len(df) == 0:
         return None, "❌ 没有数据可保存"
@@ -956,19 +934,20 @@ def create_download_package(df, topic_summary_df, method_evolution_df, content_e
     csv_path = os.path.join(OUTPUT_DIR, f"工程管理期刊分析结果_完整版_{timestamp}.csv")
     df.to_csv(csv_path, index=False, encoding="utf-8-sig")
     
-    # 保存主题总结
-    if topic_summary_df is not None and len(topic_summary_df) > 0:
-        topic_summary_path = os.path.join(OUTPUT_DIR, f"主题专家总结_{timestamp}.xlsx")
-        topic_summary_df.to_excel(topic_summary_path, index=False, encoding='utf-8')
+    # 保存方法总结
+    if method_summary_df is not None and len(method_summary_df) > 0:
+        method_summary_df.to_excel(os.path.join(OUTPUT_DIR, f"研究方法分类统计_{timestamp}.xlsx"), index=False)
     
-    # 保存演变分析数据
+    # 保存内容总结
+    if content_summary_df is not None and len(content_summary_df) > 0:
+        content_summary_df.to_excel(os.path.join(OUTPUT_DIR, f"研究内容分类统计_{timestamp}.xlsx"), index=False)
+    
+    # 保存演变数据
     if method_evolution_df is not None and len(method_evolution_df) > 0:
-        method_evo_path = os.path.join(OUTPUT_DIR, f"研究方法演变数据_{timestamp}.xlsx")
-        method_evolution_df.to_excel(method_evo_path, index=False, encoding='utf-8')
+        method_evolution_df.to_excel(os.path.join(OUTPUT_DIR, f"研究方法演变数据_{timestamp}.xlsx"), index=False)
     
     if content_evolution_df is not None and len(content_evolution_df) > 0:
-        content_evo_path = os.path.join(OUTPUT_DIR, f"研究内容演变数据_{timestamp}.xlsx")
-        content_evolution_df.to_excel(content_evo_path, index=False, encoding='utf-8')
+        content_evolution_df.to_excel(os.path.join(OUTPUT_DIR, f"研究内容演变数据_{timestamp}.xlsx"), index=False)
     
     # 保存统计报告
     stats_path = os.path.join(OUTPUT_DIR, f"分析统计报告_{timestamp}.txt")
@@ -989,21 +968,28 @@ def create_download_package(df, topic_summary_df, method_evolution_df, content_e
                 f.write(f"   {method}: {count} 次 ({count/len(df)*100:.1f}%)\n")
             f.write("\n")
         
-        if '主题编号' in df.columns:
-            f.write("3. 主题分布\n")
-            topic_counts = df['主题编号'].value_counts()
-            for topic, count in topic_counts.head(10).items():
-                f.write(f"   主题{topic}: {count} 篇\n")
+        if method_summary_df is not None and len(method_summary_df) > 0:
+            f.write("3. 研究方法类别\n")
+            if '方法类别' in method_summary_df.columns:
+                category_counts = method_summary_df.groupby('方法类别')['使用次数'].sum()
+                for category, count in category_counts.items():
+                    f.write(f"   {category}: {count} 次\n")
+            f.write("\n")
+        
+        if content_summary_df is not None and len(content_summary_df) > 0:
+            f.write("4. 研究内容类别\n")
+            for idx, row in content_summary_df.head(10).iterrows():
+                f.write(f"   {row['分类']}: {row['文章数量']}篇 ({row['占比']})\n")
             f.write("\n")
         
         if method_evolution_df is not None and len(method_evolution_df) > 0:
-            f.write("4. 研究方法演变趋势\n")
+            f.write("5. 研究方法演变趋势\n")
             years = sorted(method_evolution_df['年份'].unique())
             f.write(f"   时间跨度：{min(years)} - {max(years)}\n")
             f.write(f"   数据点数：{len(method_evolution_df)}\n\n")
         
         if content_evolution_df is not None and len(content_evolution_df) > 0:
-            f.write("5. 研究内容演变趋势\n")
+            f.write("6. 研究内容演变趋势\n")
             years = sorted(content_evolution_df['年份'].unique())
             f.write(f"   时间跨度：{min(years)} - {max(years)}\n")
             f.write(f"   数据点数：{len(content_evolution_df)}\n\n")
@@ -1033,17 +1019,21 @@ def main():
     ### ✨ 核心功能
     - ✅ 批量上传 WoS 导出的 Excel 文件
     - ✅ DeepSeek API 自动识别研究方法和研究内容
-    - ✅ BERTopic 智能主题聚类与可视化
-    - ✅ 🎓 DeepSeek 专家对每个主题进行专业总结
-    - ✅ 📈 **新增** 研究方法和研究内容时间演变分析
+    - ✅ 📝 DeepSeek 专家对研究内容进行分类总结
+    - ✅ 🎯 DeepSeek 专家对研究方法进行分类总结
+    - ✅ 📈 研究方法和研究内容时间演变分析
     - ✅ 📥 一键下载所有分析结果（ZIP 打包）
+    
+    ### 🚀 优势
+    - ⚡ **更快速**：无需下载大型模型，启动即用
+    - 💾 **更轻量**：移除 BERTopic，减少依赖
+    - 🎯 **更智能**：全部使用 DeepSeek API 进行专家级分析
     """)
     
     # 从侧边栏获取配置
     api_key = st.session_state.api_key_sidebar if hasattr(st.session_state, 'api_key_sidebar') else None
-    num_topics = st.session_state.num_topics_sidebar if hasattr(st.session_state, 'num_topics_sidebar') else 20
     batch_size = st.session_state.batch_size_sidebar if hasattr(st.session_state, 'batch_size_sidebar') else 10
-    enable_expert_summary = st.session_state.enable_expert_sidebar if hasattr(st.session_state, 'enable_expert_sidebar') else True
+    enable_content_summary = st.session_state.enable_content_sidebar if hasattr(st.session_state, 'enable_content_sidebar') else True
     enable_evolution_analysis = st.session_state.enable_evolution_sidebar if hasattr(st.session_state, 'enable_evolution_sidebar') else True
     
     st.markdown("### 📁 上传文件")
@@ -1063,8 +1053,9 @@ def main():
     # 执行分析
     if start_analysis and uploaded_files and api_key:
         try:
-            # 步骤 1: 处理上传文件
             st.markdown("### 📊 分析进度")
+            
+            # 步骤 1: 处理上传文件
             with st.expander("📁 步骤 1: 处理上传文件", expanded=True):
                 df, file_log = process_uploaded_files(uploaded_files)
                 st.text(file_log)
@@ -1076,54 +1067,57 @@ def main():
                 st.session_state.df_result = df
                 st.success(f"✅ 成功加载 {len(df)} 篇文章")
             
-            # 步骤 2: DeepSeek API 分析
-            with st.expander("🤖 步骤 2: DeepSeek API 分析", expanded=True):
+            # 步骤 2: DeepSeek API 分析文章
+            with st.expander("🤖 步骤 2: DeepSeek API 分析文章", expanded=True):
                 client = get_deepseek_client(api_key)
-                df_result, api_log = run_deepseek_analysis(st.session_state.df_result, client, batch_size)
+                df_result, api_log = run_article_analysis(st.session_state.df_result, client, batch_size)
                 st.text(api_log)
                 st.session_state.df_result = df_result
                 st.success("✅ 研究方法与分析内容识别完成")
             
-            # 步骤 3: BERTopic 主题挖掘
-            with st.expander("🔍 步骤 3: BERTopic 主题挖掘", expanded=True):
-                df_with_topics, topic_log, topic_info = run_bertopic_analysis(st.session_state.df_result, num_topics)
-                st.text(topic_log)
-                if df_with_topics is not None:
-                    st.session_state.df_result = df_with_topics
-                    st.success("✅ 主题聚类完成")
+            # 步骤 3: 研究方法分类总结
+            with st.expander("🎯 步骤 3: 研究方法分类总结", expanded=True):
+                client = get_deepseek_client(api_key)
+                method_summary, method_log, method_category = summarize_method_categories(
+                    st.session_state.df_result, 
+                    client
+                )
+                st.text(method_log)
+                if method_summary is not None:
+                    st.success("✅ 研究方法分类完成")
             
-            # 步骤 4: 主题专家总结
-            if enable_expert_summary:
-                with st.expander("🎓 步骤 4: 主题专家总结", expanded=True):
+            # 步骤 4: 研究内容分类总结
+            if enable_content_summary:
+                with st.expander("📝 步骤 4: 研究内容分类总结", expanded=True):
                     client = get_deepseek_client(api_key)
-                    df_result, summary_log, topic_summary_df = run_topic_expert_summary(
+                    content_summary, content_log, content_detail = summarize_content_categories(
                         st.session_state.df_result, 
                         client
                     )
-                    st.text(summary_log)
-                    if df_result is not None:
-                        st.session_state.df_result = df_result
-                        st.success("✅ 主题专家总结完成")
+                    st.text(content_log)
+                    if content_summary is not None:
+                        # 显示分类统计
+                        st.markdown("#### 📊 研究内容分类统计")
+                        st.dataframe(content_summary.head(10), use_container_width=True)
+                        st.success("✅ 研究内容分类完成")
             
             # 步骤 5: 时间演变分析
             if enable_evolution_analysis:
                 with st.expander("📈 步骤 5: 时间维度演变分析", expanded=True):
                     client = get_deepseek_client(api_key)
-                    method_summary, content_summary, evo_log, method_chart, content_chart = run_evolution_analysis(
+                    method_evo_summary, content_evo_summary, evo_log, method_chart, content_chart = run_evolution_analysis(
                         st.session_state.df_result,
                         client
                     )
                     st.text(evo_log)
                     
-                    if method_summary and content_summary:
-                        # 显示专家总结
+                    if method_evo_summary and content_evo_summary:
                         st.markdown("#### 🎯 研究方法演变专家总结")
-                        st.info(method_summary)
+                        st.info(method_evo_summary)
                         
                         st.markdown("#### 📝 研究内容演变专家总结")
-                        st.info(content_summary)
+                        st.info(content_evo_summary)
                         
-                        # 显示可视化图表
                         col1, col2 = st.columns(2)
                         with col1:
                             if method_chart:
@@ -1138,7 +1132,8 @@ def main():
             with st.expander("💾 步骤 6: 创建下载包", expanded=True):
                 zip_buffer, zip_filename = create_download_package(
                     st.session_state.df_result,
-                    st.session_state.topic_summary_df,
+                    st.session_state.method_summary_df,
+                    st.session_state.content_summary_df,
                     st.session_state.method_evolution_df,
                     st.session_state.content_evolution_df
                 )
@@ -1166,24 +1161,21 @@ def main():
     elif start_analysis and not uploaded_files:
         st.error("❌ 请先上传 Excel 文件")
     
-    # 结果显示（添加安全检查）
+    # 结果显示
     if st.session_state.df_result is not None and len(st.session_state.df_result) > 0:
         st.markdown("### 📈 结果预览")
         
-        # 检查必要的列是否存在
         required_columns = ['Article Title', '研究方法', '研究内容']
         existing_columns = [col for col in required_columns if col in st.session_state.df_result.columns]
         
-        if '主题编号' in st.session_state.df_result.columns:
-            existing_columns.extend(['主题编号', '主题名称'])
-        
         # 选项卡展示
-        tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
             "📊 数据预览",
-            "🎯 主题信息",
-            "🎓 专家总结",
+            "🎯 方法统计",
+            "📝 内容分类",
             "📈 方法演变",
-            "📝 内容演变"
+            "📝 内容演变",
+            "📥 下载"
         ])
         
         with tab1:
@@ -1192,44 +1184,48 @@ def main():
                     st.session_state.df_result[existing_columns].head(10),
                     use_container_width=True
                 )
-            else:
-                st.warning("暂无可显示的数据列")
         
         with tab2:
-            if 'topic_info' in st.session_state and st.session_state.topic_info is not None:
+            if st.session_state.method_summary_df is not None:
                 st.dataframe(
-                    st.session_state.topic_info[['Topic', 'Name', 'Count']].head(20),
+                    st.session_state.method_summary_df.head(20),
                     use_container_width=True
                 )
             else:
-                st.warning("主题信息尚未生成，请先完成主题挖掘步骤")
+                st.warning("研究方法统计尚未生成")
         
         with tab3:
-            if st.session_state.topic_summary_df is not None and len(st.session_state.topic_summary_df) > 0:
+            if st.session_state.content_summary_df is not None:
                 st.dataframe(
-                    st.session_state.topic_summary_df[['主题编号', '主题名称', '主题关键词', '文章数量']].head(20),
+                    st.session_state.content_summary_df.head(20),
                     use_container_width=True
                 )
             else:
-                st.warning("主题专家总结尚未生成，请启用该选项并完成分析")
+                st.warning("研究内容分类尚未生成")
         
         with tab4:
-            if st.session_state.method_evolution_df is not None and len(st.session_state.method_evolution_df) > 0:
+            if st.session_state.method_evolution_df is not None:
                 st.dataframe(
                     st.session_state.method_evolution_df.head(20),
                     use_container_width=True
                 )
             else:
-                st.warning("研究方法演变数据尚未生成，请启用时间演变分析")
+                st.warning("研究方法演变数据尚未生成")
         
         with tab5:
-            if st.session_state.content_evolution_df is not None and len(st.session_state.content_evolution_df) > 0:
+            if st.session_state.content_evolution_df is not None:
                 st.dataframe(
                     st.session_state.content_evolution_df.head(20),
                     use_container_width=True
                 )
             else:
-                st.warning("研究内容演变数据尚未生成，请启用时间演变分析")
+                st.warning("研究内容演变数据尚未生成")
+        
+        with tab6:
+            if st.session_state.analysis_complete:
+                st.success("✅ 分析已完成，请在上方下载按钮处下载结果")
+            else:
+                st.info("请先完成分析流程")
     
     # 使用说明
     with st.expander("💡 使用说明", expanded=False):
@@ -1237,26 +1233,25 @@ def main():
         ### 📋 使用流程
         1. 在侧边栏输入 DeepSeek API Key
         2. 上传从 WoS 下载的 Excel 文件
-        3. 设置主题聚类数量（建议 15-25）
-        4. 选择是否启用主题专家总结和时间演变分析
-        5. 点击"开始分析"按钮
-        6. 等待分析完成
-        7. 点击"下载完整结果包"按钮
+        3. 选择是否启用研究内容总结和时间演变分析
+        4. 点击"开始分析"按钮
+        5. 等待分析完成
+        6. 点击"下载完整结果包"按钮
         
         ### ⚠️ 注意事项
         - 请确保 DeepSeek API 密钥有效且有足够额度
         - 大量文章分析时可能需要较长时间
-        - 启用主题专家总结会增加 API 调用次数（每个主题 1 次调用）
-        - 启用时间演变分析会增加 2 次 API 调用（研究方法 + 研究内容）
-        - 首次运行需要下载 BERTopic 模型（约 500MB）
+        - 启用研究内容总结会增加 API 调用次数
+        - 启用时间演变分析会增加 2 次 API 调用
         
         ### 📁 输出文件说明
         | 文件名 | 说明 |
         |--------|------|
         | 工程管理期刊分析结果_完整版.xlsx | 完整分析结果 |
-        | 主题专家总结.xlsx | 主题专家总结 |
-        | 研究方法演变数据.xlsx | 研究方法时间序列数据 |
-        | 研究内容演变数据.xlsx | 研究内容时间序列数据 |
+        | 研究方法分类统计.xlsx | 研究方法分类统计 |
+        | 研究内容分类统计.xlsx | 研究内容分类统计 |
+        | 研究方法演变数据.xlsx | 研究方法时间序列 |
+        | 研究内容演变数据.xlsx | 研究内容时间序列 |
         | 研究方法演变趋势.html | 交互式演变图表 |
         | 研究内容演变趋势.html | 交互式演变图表 |
         | 分析统计报告.txt | 完整统计报告 |
